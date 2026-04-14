@@ -10,15 +10,15 @@ import hashlib
 from datetime import datetime, timedelta
 from typing import List, Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
-    PreCheckoutQueryHandler,
     ContextTypes,
-    filters
+    filters,
+    ConversationHandler
 )
 
 import aiohttp
@@ -31,6 +31,10 @@ YOOMONEY_ACCESS_TOKEN = "4100118889570559.3288B2E716CEEB922A26BD6BEAC58648FBFB68
 YOOMONEY_WALLET = "4100118889570559"
 
 DB_NAME = "vpn_bot.db"
+
+# Состояния для ConversationHandler
+WAITING_TARIFF_NAME, WAITING_TARIFF_DAYS, WAITING_TARIFF_PRICE, WAITING_TARIFF_DESC = range(4)
+WAITING_CONFIG_FILE = range(1)
 
 # Настройка логирования
 logging.basicConfig(
@@ -87,6 +91,7 @@ def init_db():
             payment_id TEXT PRIMARY KEY,
             user_id INTEGER,
             amount REAL,
+            tariff_id INTEGER,
             status TEXT,
             created_date TEXT,
             FOREIGN KEY (user_id) REFERENCES users(user_id)
@@ -179,10 +184,40 @@ def get_tariffs() -> List[tuple]:
     """Получить все тарифы"""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, name, duration_days, price, description FROM tariffs")
+    cursor.execute("SELECT id, name, duration_days, price, description FROM tariffs ORDER BY price")
     tariffs = cursor.fetchall()
     conn.close()
     return tariffs
+
+def get_tariff_by_id(tariff_id: int) -> Optional[tuple]:
+    """Получить тариф по ID"""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, name, duration_days, price, description FROM tariffs WHERE id = ?", (tariff_id,))
+    tariff = cursor.fetchone()
+    conn.close()
+    return tariff
+
+def add_tariff(name: str, duration_days: int, price: float, description: str) -> int:
+    """Добавить новый тариф"""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO tariffs (name, duration_days, price, description) VALUES (?, ?, ?, ?)",
+        (name, duration_days, price, description)
+    )
+    tariff_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return tariff_id
+
+def delete_tariff(tariff_id: int):
+    """Удалить тариф"""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM tariffs WHERE id = ?", (tariff_id,))
+    conn.commit()
+    conn.close()
 
 def add_purchase(user_id: int, config_id: int, payment_id: str, amount: float, duration_days: int):
     """Добавить покупку"""
@@ -198,18 +233,30 @@ def add_purchase(user_id: int, config_id: int, payment_id: str, amount: float, d
     conn.commit()
     conn.close()
 
-def create_payment(user_id: int, amount: float) -> str:
+def create_payment(user_id: int, amount: float, tariff_id: int) -> str:
     """Создать платеж"""
     payment_id = str(uuid.uuid4())
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO payments (payment_id, user_id, amount, status, created_date) VALUES (?, ?, ?, ?, ?)",
-        (payment_id, user_id, amount, 'pending', datetime.now().isoformat())
+        "INSERT INTO payments (payment_id, user_id, amount, tariff_id, status, created_date) VALUES (?, ?, ?, ?, ?, ?)",
+        (payment_id, user_id, amount, tariff_id, 'pending', datetime.now().isoformat())
     )
     conn.commit()
     conn.close()
     return payment_id
+
+def get_payment(payment_id: str) -> Optional[tuple]:
+    """Получить платеж"""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT payment_id, user_id, amount, tariff_id, status FROM payments WHERE payment_id = ?",
+        (payment_id,)
+    )
+    payment = cursor.fetchone()
+    conn.close()
+    return payment
 
 def update_payment_status(payment_id: str, status: str):
     """Обновить статус платежа"""
@@ -271,11 +318,8 @@ def get_stats() -> dict:
     }
 
 # ==================== YOOMONEY ====================
-async def create_yoomoney_payment(amount: float, label: str) -> Optional[str]:
+async def create_yoomoney_payment(amount: float, label: str) -> str:
     """Создать платеж YooMoney"""
-    url = "https://yoomoney.ru/quickpay/confirm.xml"
-    
-    # Формируем ссылку на оплату
     payment_url = (
         f"https://yoomoney.ru/quickpay/confirm.xml?"
         f"receiver={YOOMONEY_WALLET}&"
@@ -288,7 +332,7 @@ async def create_yoomoney_payment(amount: float, label: str) -> Optional[str]:
     
     return payment_url
 
-async def check_payment_status(label: str) -> bool:
+async def check_payment_status(label: str, amount: float) -> bool:
     """Проверить статус платежа через YooMoney API"""
     url = "https://yoomoney.ru/api/operation-history"
     
@@ -297,20 +341,21 @@ async def check_payment_status(label: str) -> bool:
         "Content-Type": "application/x-www-form-urlencoded"
     }
     
-    data = {
-        "label": label
-    }
-    
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, data=data) as response:
+            async with session.post(url, headers=headers) as response:
                 if response.status == 200:
                     result = await response.json()
                     operations = result.get('operations', [])
                     
+                    # Проверяем последние операции
                     for operation in operations:
-                        if operation.get('label') == label and operation.get('status') == 'success':
+                        if (operation.get('label') == label and 
+                            operation.get('status') == 'success' and
+                            float(operation.get('amount', 0)) >= amount):
                             return True
+                else:
+                    logger.error(f"Ошибка YooMoney API: {response.status}")
                     
         return False
     except Exception as e:
@@ -369,11 +414,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif data.startswith("buy_tariff_"):
         tariff_id = int(data.split("_")[2])
-        await process_tariff_selection(query, user_id, tariff_id)
+        await process_tariff_selection(query, context, user_id, tariff_id)
     
     elif data.startswith("check_payment_"):
         payment_id = data.split("_", 2)[2]
-        await check_payment(query, user_id, payment_id)
+        await check_payment(query, context, user_id, payment_id)
     
     elif data == "admin_add_config":
         if user_id in ADMIN_IDS:
@@ -391,8 +436,32 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id in ADMIN_IDS:
             await show_admin_configs(query)
     
+    elif data == "admin_tariffs":
+        if user_id in ADMIN_IDS:
+            await show_admin_tariffs(query)
+    
+    elif data == "admin_add_tariff":
+        if user_id in ADMIN_IDS:
+            await start_add_tariff(query, context)
+    
+    elif data.startswith("admin_delete_tariff_"):
+        if user_id in ADMIN_IDS:
+            tariff_id = int(data.split("_")[3])
+            await delete_tariff_confirm(query, tariff_id)
+    
+    elif data.startswith("confirm_delete_tariff_"):
+        if user_id in ADMIN_IDS:
+            tariff_id = int(data.split("_")[3])
+            delete_tariff(tariff_id)
+            await query.message.edit_text("✅ Тариф удален!")
+            await asyncio.sleep(1)
+            await show_admin_tariffs(query)
+    
     elif data == "back_to_menu":
         await back_to_menu(query)
+    
+    elif data == "back_to_admin":
+        await show_admin_panel(query)
 
 async def show_tariffs(query):
     """Показать тарифы"""
@@ -415,6 +484,7 @@ async def show_tariffs(query):
     for tariff in tariffs:
         tariff_id, name, duration_days, price, description = tariff
         text += f"💎 <b>{name}</b> - {price} ₽\n"
+        text += f"   📅 Срок: {duration_days} дней\n"
         text += f"   {description}\n\n"
         
         keyboard.append([InlineKeyboardButton(
@@ -426,19 +496,15 @@ async def show_tariffs(query):
     
     await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
-async def process_tariff_selection(query, user_id: int, tariff_id: int):
+async def process_tariff_selection(query, context: ContextTypes.DEFAULT_TYPE, user_id: int, tariff_id: int):
     """Обработка выбора тарифа"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT name, duration_days, price FROM tariffs WHERE id = ?", (tariff_id,))
-    tariff = cursor.fetchone()
-    conn.close()
+    tariff = get_tariff_by_id(tariff_id)
     
     if not tariff:
         await query.message.edit_text("❌ Тариф не найден.")
         return
     
-    name, duration_days, price = tariff
+    _, name, duration_days, price, description = tariff
     
     # Проверяем наличие конфига
     config = get_available_config()
@@ -451,17 +517,15 @@ async def process_tariff_selection(query, user_id: int, tariff_id: int):
         return
     
     # Создаем платеж
-    payment_id = create_payment(user_id, price)
+    payment_id = create_payment(user_id, price, tariff_id)
     
-    # Сохраняем данные о тарифе в context
-    context_data = query._bot._application.user_data.get(user_id, {})
-    context_data[f'payment_{payment_id}'] = {
+    # Сохраняем данные в user_data
+    context.user_data[f'payment_{payment_id}'] = {
         'tariff_id': tariff_id,
         'duration_days': duration_days,
         'price': price,
         'config_id': config[0]
     }
-    query._bot._application.user_data[user_id] = context_data
     
     # Создаем ссылку на оплату
     payment_url = await create_yoomoney_payment(price, payment_id)
@@ -470,109 +534,135 @@ async def process_tariff_selection(query, user_id: int, tariff_id: int):
         f"💳 <b>Оплата VPN</b>\n\n"
         f"📦 Тариф: <b>{name}</b>\n"
         f"💰 Сумма: <b>{price} ₽</b>\n"
-        f"⏱ Срок: <b>{duration_days} дней</b>\n\n"
-        f"🔗 Для оплаты перейдите по ссылке ниже:\n"
-        f"После оплаты нажмите кнопку 'Проверить оплату'"
+        f"⏱ Срок: <b>{duration_days} дней</b>\n"
+        f"📝 {description}\n\n"
+        f"🔗 Для оплаты нажмите кнопку ниже.\n"
+        f"После оплаты нажмите 'Проверить оплату'"
     )
     
     keyboard = [
-        [InlineKeyboardButton("💳 Оплатить", url=payment_url)],
+        [InlineKeyboardButton("💳 Оплатить через ЮMoney", url=payment_url)],
         [InlineKeyboardButton("✅ Проверить оплату", callback_data=f"check_payment_{payment_id}")],
         [InlineKeyboardButton("◀️ Назад", callback_data="buy_vpn")]
     ]
     
     await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    
+    # Запускаем автоматическую проверку платежа
+    asyncio.create_task(auto_check_payment(context, query, user_id, payment_id, price))
 
-async def check_payment(query, user_id: int, payment_id: str):
-    """Проверка оплаты"""
+async def auto_check_payment(context: ContextTypes.DEFAULT_TYPE, query, user_id: int, payment_id: str, amount: float):
+    """Автоматическая проверка платежа каждые 10 секунд в течение 10 минут"""
+    max_attempts = 60  # 10 минут (60 попыток по 10 секунд)
+    
+    for attempt in range(max_attempts):
+        await asyncio.sleep(10)  # Ждем 10 секунд
+        
+        # Проверяем оплату
+        is_paid = await check_payment_status(payment_id, amount)
+        
+        if is_paid:
+            # Получаем данные о платеже
+            payment_data = context.user_data.get(f'payment_{payment_id}')
+            
+            if payment_data:
+                await process_successful_payment(context, query, user_id, payment_id, payment_data)
+            break
+        
+        logger.info(f"Автопроверка платежа {payment_id}: попытка {attempt + 1}/{max_attempts}")
+
+async def check_payment(query, context: ContextTypes.DEFAULT_TYPE, user_id: int, payment_id: str):
+    """Ручная проверка оплаты"""
     await query.answer("🔄 Проверяем оплату...")
     
     # Получаем данные о платеже
-    context_data = query._bot._application.user_data.get(user_id, {})
-    payment_data = context_data.get(f'payment_{payment_id}')
+    payment_data = context.user_data.get(f'payment_{payment_id}')
     
     if not payment_data:
-        await query.message.edit_text("❌ Данные о платеже не найдены.")
+        await query.answer("❌ Данные о платеже не найдены.", show_alert=True)
         return
     
     # Проверяем статус платежа
-    is_paid = await check_payment_status(payment_id)
+    is_paid = await check_payment_status(payment_id, payment_data['price'])
     
     if is_paid:
-        # Получаем конфиг
-        config_id = payment_data['config_id']
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("SELECT config_name, config_data FROM vpn_configs WHERE id = ?", (config_id,))
-        config = cursor.fetchone()
-        conn.close()
-        
-        if not config:
-            await query.message.edit_text("❌ Конфигурация не найдена.")
-            return
-        
-        config_name, config_data = config
-        
-        # Сохраняем покупку
-        add_purchase(
-            user_id,
-            config_id,
-            payment_id,
-            payment_data['price'],
-            payment_data['duration_days']
-        )
-        
-        # Помечаем конфиг как проданный
-        mark_config_as_sold(config_id)
-        
-        # Обновляем статус платежа
-        update_payment_status(payment_id, 'completed')
-        
-        # Отправляем конфиг пользователю
-        success_text = (
-            f"✅ <b>Оплата успешно подтверждена!</b>\n\n"
-            f"🎉 Спасибо за покупку!\n"
-            f"📁 Ваш VPN конфиг отправлен ниже.\n\n"
-            f"📝 <b>Инструкция по подключению:</b>\n"
-            f"1. Скачайте приложение WireGuard\n"
-            f"2. Импортируйте полученный файл\n"
-            f"3. Активируйте подключение\n\n"
-            f"💬 Если возникнут вопросы - обращайтесь в поддержку!"
-        )
-        
-        await query.message.edit_text(success_text, parse_mode='HTML')
-        
-        # Отправляем файл конфига
-        from io import BytesIO
-        config_file = BytesIO(config_data.encode('utf-8'))
-        config_file.name = config_name
-        
-        await query.message.reply_document(
-            document=config_file,
-            filename=config_name,
-            caption=f"📁 Ваш VPN конфиг: {config_name}"
-        )
-        
-        # Уведомляем админов о продаже
-        for admin_id in ADMIN_IDS:
-            try:
-                await query._bot.send_message(
-                    admin_id,
-                    f"💰 <b>Новая продажа!</b>\n\n"
-                    f"👤 Пользователь: {query.from_user.first_name} (@{query.from_user.username})\n"
-                    f"💵 Сумма: {payment_data['price']} ₽\n"
-                    f"📁 Конфиг: {config_name}",
-                    parse_mode='HTML'
-                )
-            except:
-                pass
-        
-        # Очищаем данные о платеже
-        del context_data[f'payment_{payment_id}']
-        query._bot._application.user_data[user_id] = context_data
-        
+        await process_successful_payment(context, query, user_id, payment_id, payment_data)
     else:
         await query.answer("❌ Оплата не найдена. Попробуйте еще раз через несколько секунд.", show_alert=True)
+
+async def process_successful_payment(context: ContextTypes.DEFAULT_TYPE, query, user_id: int, payment_id: str, payment_data: dict):
+    """Обработка успешного платежа"""
+    # Получаем конфиг
+    config_id = payment_data['config_id']
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT config_name, config_data FROM vpn_configs WHERE id = ?", (config_id,))
+    config = cursor.fetchone()
+    conn.close()
+    
+    if not config:
+        await query.message.edit_text("❌ Конфигурация не найдена.")
+        return
+    
+    config_name, config_data = config
+    
+    # Сохраняем покупку
+    add_purchase(
+        user_id,
+        config_id,
+        payment_id,
+        payment_data['price'],
+        payment_data['duration_days']
+    )
+    
+    # Помечаем конфиг как проданный
+    mark_config_as_sold(config_id)
+    
+    # Обновляем статус платежа
+    update_payment_status(payment_id, 'completed')
+    
+    # Отправляем конфиг пользователю
+    success_text = (
+        f"✅ <b>Оплата успешно подтверждена!</b>\n\n"
+        f"🎉 Спасибо за покупку!\n"
+        f"📁 Ваш VPN конфиг отправлен ниже.\n\n"
+        f"📝 <b>Инструкция по подключению:</b>\n"
+        f"1. Скачайте приложение WireGuard\n"
+        f"2. Импортируйте полученный файл\n"
+        f"3. Активируйте подключение\n\n"
+        f"💬 Если возникнут вопросы - обращайтесь в поддержку!"
+    )
+    
+    await query.message.edit_text(success_text, parse_mode='HTML')
+    
+    # Отправляем файл конфига
+    from io import BytesIO
+    config_file = BytesIO(config_data.encode('utf-8'))
+    config_file.name = config_name
+    
+    await query.message.reply_document(
+        document=config_file,
+        filename=config_name,
+        caption=f"📁 Ваш VPN конфиг: {config_name}"
+    )
+    
+    # Уведомляем админов о продаже
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                admin_id,
+                f"💰 <b>Новая продажа!</b>\n\n"
+                f"👤 Пользователь: {query.from_user.first_name} (@{query.from_user.username or 'без username'})\n"
+                f"💵 Сумма: {payment_data['price']} ₽\n"
+                f"📁 Конфиг: {config_name}",
+                parse_mode='HTML'
+            )
+        except:
+            pass
+    
+    # Очищаем данные о платеже
+    if f'payment_{payment_id}' in context.user_data:
+        del context.user_data[f'payment_{payment_id}']
 
 async def show_my_purchases(query, user_id: int):
     """Показать покупки пользователя"""
@@ -639,6 +729,7 @@ async def show_admin_panel(query):
         [InlineKeyboardButton("➕ Добавить конфиг", callback_data="admin_add_config")],
         [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
         [InlineKeyboardButton("📁 Конфиги", callback_data="admin_configs")],
+        [InlineKeyboardButton("💎 Тарифы", callback_data="admin_tariffs")],
         [InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu")]
     ]
     
@@ -667,7 +758,7 @@ async def show_admin_configs(query):
     """Показать список конфигов"""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT config_name, is_sold FROM vpn_configs ORDER BY added_date DESC LIMIT 20")
+    cursor.execute("SELECT config_name, is_sold, added_date FROM vpn_configs ORDER BY added_date DESC LIMIT 20")
     configs = cursor.fetchall()
     conn.close()
     
@@ -676,13 +767,75 @@ async def show_admin_configs(query):
     else:
         text = "📁 <b>Последние 20 конфигов:</b>\n\n"
         
-        for config_name, is_sold in configs:
+        for config_name, is_sold, added_date in configs:
             status = "❌ Продан" if is_sold else "✅ Доступен"
-            text += f"• {config_name} - {status}\n"
+            date = datetime.fromisoformat(added_date).strftime('%d.%m.%Y %H:%M')
+            text += f"• {config_name}\n  {status} | {date}\n\n"
     
     keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data="admin_panel")]]
     
     await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+async def show_admin_tariffs(query):
+    """Показать тарифы для админа"""
+    tariffs = get_tariffs()
+    
+    text = "💎 <b>Управление тарифами:</b>\n\n"
+    
+    keyboard = []
+    
+    if tariffs:
+        for tariff in tariffs:
+            tariff_id, name, duration_days, price, description = tariff
+            text += (
+                f"🔹 <b>{name}</b>\n"
+                f"   💰 Цена: {price} ₽\n"
+                f"   📅 Срок: {duration_days} дней\n"
+                f"   📝 {description}\n\n"
+            )
+            
+            keyboard.append([
+                InlineKeyboardButton(f"🗑 Удалить: {name}", callback_data=f"admin_delete_tariff_{tariff_id}")
+            ])
+    else:
+        text += "Тарифов пока нет.\n\n"
+    
+    keyboard.append([InlineKeyboardButton("➕ Добавить тариф", callback_data="admin_add_tariff")])
+    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="admin_panel")])
+    
+    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+async def start_add_tariff(query, context: ContextTypes.DEFAULT_TYPE):
+    """Начать добавление тарифа"""
+    await query.message.edit_text(
+        "➕ <b>Добавление нового тарифа</b>\n\n"
+        "📝 Введите название тарифа (например: '1 месяц'):\n\n"
+        "Или /cancel для отмены",
+        parse_mode='HTML'
+    )
+    context.user_data['adding_tariff'] = {}
+    context.user_data['tariff_step'] = 'name'
+
+async def delete_tariff_confirm(query, tariff_id: int):
+    """Подтверждение удаления тарифа"""
+    tariff = get_tariff_by_id(tariff_id)
+    
+    if not tariff:
+        await query.answer("❌ Тариф не найден")
+        return
+    
+    _, name, _, _, _ = tariff
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ Да, удалить", callback_data=f"confirm_delete_tariff_{tariff_id}")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="admin_tariffs")]
+    ]
+    
+    await query.message.edit_text(
+        f"❓ Вы уверены, что хотите удалить тариф:\n\n<b>{name}</b>?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='HTML'
+    )
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка загрузки документов"""
@@ -716,6 +869,73 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🆔 ID: {config_id}\n\n"
         f"Всего доступно: {get_available_configs_count()}"
     )
+
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка текстовых сообщений"""
+    user_id = update.effective_user.id
+    
+    if user_id not in ADMIN_IDS:
+        return
+    
+    # Обработка добавления тарифа
+    if context.user_data.get('tariff_step'):
+        step = context.user_data['tariff_step']
+        tariff_data = context.user_data.get('adding_tariff', {})
+        
+        if step == 'name':
+            tariff_data['name'] = update.message.text
+            context.user_data['adding_tariff'] = tariff_data
+            context.user_data['tariff_step'] = 'days'
+            await update.message.reply_text(
+                "📅 Введите количество дней (например: 30):"
+            )
+        
+        elif step == 'days':
+            try:
+                days = int(update.message.text)
+                tariff_data['days'] = days
+                context.user_data['adding_tariff'] = tariff_data
+                context.user_data['tariff_step'] = 'price'
+                await update.message.reply_text(
+                    "💰 Введите цену в рублях (например: 150):"
+                )
+            except ValueError:
+                await update.message.reply_text("❌ Введите число!")
+        
+        elif step == 'price':
+            try:
+                price = float(update.message.text)
+                tariff_data['price'] = price
+                context.user_data['adding_tariff'] = tariff_data
+                context.user_data['tariff_step'] = 'description'
+                await update.message.reply_text(
+                    "📝 Введите описание тарифа:"
+                )
+            except ValueError:
+                await update.message.reply_text("❌ Введите число!")
+        
+        elif step == 'description':
+            tariff_data['description'] = update.message.text
+            
+            # Сохраняем тариф
+            tariff_id = add_tariff(
+                tariff_data['name'],
+                tariff_data['days'],
+                tariff_data['price'],
+                tariff_data['description']
+            )
+            
+            # Очищаем данные
+            context.user_data.pop('adding_tariff', None)
+            context.user_data.pop('tariff_step', None)
+            
+            await update.message.reply_text(
+                f"✅ Тариф успешно добавлен!\n\n"
+                f"📦 Название: {tariff_data['name']}\n"
+                f"📅 Срок: {tariff_data['days']} дней\n"
+                f"💰 Цена: {tariff_data['price']} ₽\n"
+                f"📝 Описание: {tariff_data['description']}"
+            )
 
 async def back_to_menu(query):
     """Вернуться в главное меню"""
@@ -759,9 +979,10 @@ def main():
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     
     # Запуск бота
-    logger.info("Бот запущен!")
+    logger.info("🚀 Бот запущен!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
