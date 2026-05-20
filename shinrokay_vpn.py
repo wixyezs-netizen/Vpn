@@ -1402,12 +1402,33 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("❌ Отменено")
 
+async def auto_broadcast_loop(application):
+    """Резервный планировщик, если JobQueue не установлен."""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            await auto_broadcast_job(type('Ctx', (), {'bot': application.bot})())
+        except Exception as e:
+            logger.error(f"Ошибка авто-рассылки: {e}")
+        await asyncio.sleep(3600)
+
+async def on_startup(application):
+    if application.job_queue:
+        application.job_queue.run_repeating(auto_broadcast_job, interval=3600, first=60)
+        logger.info("Авто-рассылка: JobQueue")
+    else:
+        asyncio.create_task(auto_broadcast_loop(application))
+        logger.warning(
+            "JobQueue недоступен. Установите: pip install \"python-telegram-bot[job-queue]\". "
+            "Авто-рассылка работает через asyncio."
+        )
+
 def main():
     init_db()
     application = (
         Application.builder()
         .token(BOT_TOKEN)
-        .job_queue(True)
+        .post_init(on_startup)
         .build()
     )
     
@@ -1417,9 +1438,6 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
-
-    if application.job_queue:
-        application.job_queue.run_repeating(auto_broadcast_job, interval=3600, first=60)
     
     logger.info("🚀 Бот запущен с категориями VPN и рассылкой!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
