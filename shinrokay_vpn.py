@@ -99,6 +99,24 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users(user_id)
         )
     ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS broadcast_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            enabled INTEGER DEFAULT 0,
+            interval_hours INTEGER DEFAULT 24,
+            message_text TEXT DEFAULT '',
+            photo_file_id TEXT,
+            last_sent TEXT
+        )
+    ''')
+    cursor.execute(
+        "INSERT OR IGNORE INTO broadcast_settings (id, enabled, interval_hours, message_text) VALUES (1, 0, 24, '')"
+    )
+    try:
+        cursor.execute("ALTER TABLE broadcast_settings ADD COLUMN photo_file_id TEXT")
+    except sqlite3.OperationalError:
+        pass
     
     # Добавляем дефолтные категории VPN
     cursor.execute("SELECT COUNT(*) FROM vpn_categories")
@@ -313,6 +331,69 @@ def get_stats() -> dict:
         'total_revenue': total_revenue
     }
 
+def get_all_user_ids() -> List[int]:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM users")
+    user_ids = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return user_ids
+
+def get_broadcast_settings() -> dict:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT enabled, interval_hours, message_text, photo_file_id, last_sent FROM broadcast_settings WHERE id = 1"
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return {'enabled': 0, 'interval_hours': 24, 'message_text': '', 'photo_file_id': None, 'last_sent': None}
+    return {
+        'enabled': bool(row[0]),
+        'interval_hours': row[1] or 24,
+        'message_text': row[2] or '',
+        'photo_file_id': row[3],
+        'last_sent': row[4],
+    }
+
+def save_broadcast_settings(enabled: Optional[bool] = None, interval_hours: Optional[int] = None,
+                            message_text: Optional[str] = None, photo_file_id: Optional[str] = None,
+                            last_sent: Optional[str] = None, clear_photo: bool = False):
+    current = get_broadcast_settings()
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    new_photo = None if clear_photo else (photo_file_id if photo_file_id is not None else current['photo_file_id'])
+    cursor.execute(
+        """UPDATE broadcast_settings SET
+           enabled = ?, interval_hours = ?, message_text = ?, photo_file_id = ?, last_sent = ?
+           WHERE id = 1""",
+        (
+            int(enabled if enabled is not None else current['enabled']),
+            interval_hours if interval_hours is not None else current['interval_hours'],
+            message_text if message_text is not None else current['message_text'],
+            new_photo,
+            last_sent if last_sent is not None else current['last_sent'],
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+async def send_broadcast(bot, user_ids: List[int], text: str, photo_file_id: Optional[str] = None) -> tuple:
+    success, failed = 0, 0
+    for uid in user_ids:
+        try:
+            if photo_file_id:
+                await bot.send_photo(uid, photo=photo_file_id, caption=text, parse_mode='HTML')
+            else:
+                await bot.send_message(uid, text, parse_mode='HTML')
+            success += 1
+        except Exception as e:
+            logger.warning(f"Рассылка не доставлена {uid}: {e}")
+            failed += 1
+        await asyncio.sleep(0.05)
+    return success, failed
+
 # ==================== YOOMONEY ====================
 async def create_yoomoney_payment(amount: float, label: str) -> str:
     payment_url = (
@@ -450,6 +531,42 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_categories(query)
     elif data == "back_to_admin":
         await show_admin_panel(query)
+    elif data == "admin_broadcast" and user_id in ADMIN_IDS:
+        await show_broadcast_menu(query)
+    elif data == "admin_broadcast_now" and user_id in ADMIN_IDS:
+        await start_manual_broadcast(query, context)
+    elif data == "admin_broadcast_confirm" and user_id in ADMIN_IDS:
+        await execute_manual_broadcast(query, context)
+    elif data == "admin_broadcast_cancel" and user_id in ADMIN_IDS:
+        context.user_data.pop('broadcast_step', None)
+        context.user_data.pop('broadcast_text', None)
+        context.user_data.pop('broadcast_photo', None)
+        await show_broadcast_menu(query)
+    elif data == "admin_broadcast_auto" and user_id in ADMIN_IDS:
+        await show_auto_broadcast_settings(query)
+    elif data == "admin_broadcast_auto_toggle" and user_id in ADMIN_IDS:
+        settings = get_broadcast_settings()
+        save_broadcast_settings(enabled=not settings['enabled'])
+        await show_auto_broadcast_settings(query)
+    elif data == "admin_broadcast_auto_interval" and user_id in ADMIN_IDS:
+        context.user_data['auto_broadcast_step'] = 'interval'
+        await query.message.edit_text(
+            "⏱ <b>Интервал авто-рассылки</b>\n\n"
+            "Введите количество часов между рассылками (например: 24, 12, 168):\n\n"
+            "/cancel — отмена",
+            parse_mode='HTML',
+        )
+    elif data == "admin_broadcast_auto_message" and user_id in ADMIN_IDS:
+        context.user_data['auto_broadcast_step'] = 'message'
+        await query.message.edit_text(
+            "📝 <b>Текст авто-рассылки</b>\n\n"
+            "Отправьте текст сообщения (HTML: &lt;b&gt;, &lt;i&gt;, &lt;code&gt;).\n"
+            "Можно отправить фото с подписью.\n\n"
+            "/cancel — отмена",
+            parse_mode='HTML',
+        )
+    elif data == "admin_broadcast_auto_test" and user_id in ADMIN_IDS:
+        await test_auto_broadcast(query, context)
 
 async def show_categories(query):
     categories = get_vpn_categories()
@@ -805,6 +922,7 @@ async def show_admin_panel(query):
     keyboard = [
         [InlineKeyboardButton("➕ Добавить конфиг", callback_data="admin_add_config")],
         [InlineKeyboardButton("⏳ Ожидающие платежи", callback_data="admin_pending_payments")],
+        [InlineKeyboardButton("📢 Рассылка", callback_data="admin_broadcast")],
         [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
         [InlineKeyboardButton("📁 Конфиги", callback_data="admin_configs")],
         [InlineKeyboardButton("📂 Категории", callback_data="admin_categories")],
@@ -812,6 +930,178 @@ async def show_admin_panel(query):
     ]
     
     await query.message.edit_text("👨‍💼 <b>Админ панель</b>", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+async def show_broadcast_menu(query):
+    user_ids = get_all_user_ids()
+    settings = get_broadcast_settings()
+    auto_status = "✅ Включена" if settings['enabled'] else "❌ Выключена"
+    last_sent = "—"
+    if settings['last_sent']:
+        last_sent = datetime.fromisoformat(settings['last_sent']).strftime('%d.%m.%Y %H:%M')
+
+    text = (
+        "📢 <b>Рассылка</b>\n\n"
+        f"👥 Пользователей в базе: <b>{len(user_ids)}</b>\n\n"
+        f"🤖 <b>Авто-рассылка:</b> {auto_status}\n"
+        f"⏱ Интервал: <b>{settings['interval_hours']} ч.</b>\n"
+        f"🕐 Последняя авто-рассылка: {last_sent}\n"
+    )
+    if settings['message_text']:
+        preview = settings['message_text'][:80] + ("..." if len(settings['message_text']) > 80 else "")
+        text += f"\n📝 Текст авто-рассылки:\n<i>{preview}</i>"
+
+    keyboard = [
+        [InlineKeyboardButton("📤 Отправить сейчас", callback_data="admin_broadcast_now")],
+        [InlineKeyboardButton("⚙️ Авто-рассылка", callback_data="admin_broadcast_auto")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="admin_panel")],
+    ]
+    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+async def start_manual_broadcast(query, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['broadcast_step'] = 'message'
+    await query.message.edit_text(
+        "📤 <b>Ручная рассылка</b>\n\n"
+        "Отправьте текст сообщения для всех пользователей.\n"
+        "Можно отправить фото с подписью.\n\n"
+        "HTML: &lt;b&gt;жирный&lt;/b&gt;, &lt;i&gt;курсив&lt;/i&gt;, &lt;code&gt;код&lt;/code&gt;\n\n"
+        "/cancel — отмена",
+        parse_mode='HTML',
+    )
+
+async def show_broadcast_preview(update_or_query, context: ContextTypes.DEFAULT_TYPE, is_message: bool = False):
+    text = context.user_data.get('broadcast_text', '')
+    photo = context.user_data.get('broadcast_photo')
+    user_count = len(get_all_user_ids())
+
+    preview_text = (
+        f"📋 <b>Предпросмотр рассылки</b>\n\n"
+        f"👥 Получателей: <b>{user_count}</b>\n\n"
+        f"─── Сообщение ───\n{text or '(без текста)'}"
+    )
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Отправить", callback_data="admin_broadcast_confirm"),
+            InlineKeyboardButton("❌ Отмена", callback_data="admin_broadcast_cancel"),
+        ]
+    ]
+    markup = InlineKeyboardMarkup(keyboard)
+
+    if is_message:
+        if photo:
+            await update_or_query.reply_photo(
+                photo=photo, caption=preview_text, reply_markup=markup, parse_mode='HTML'
+            )
+        else:
+            await update_or_query.reply_text(preview_text, reply_markup=markup, parse_mode='HTML')
+    else:
+        if photo:
+            await update_or_query.message.reply_photo(
+                photo=photo, caption=preview_text, reply_markup=markup, parse_mode='HTML'
+            )
+        else:
+            await update_or_query.message.edit_text(preview_text, reply_markup=markup, parse_mode='HTML')
+
+async def execute_manual_broadcast(query, context: ContextTypes.DEFAULT_TYPE):
+    text = context.user_data.get('broadcast_text', '')
+    photo = context.user_data.get('broadcast_photo')
+    if not text and not photo:
+        await query.answer("❌ Нет сообщения для рассылки", show_alert=True)
+        return
+
+    await query.message.edit_text("📤 Рассылка запущена, подождите...")
+    user_ids = get_all_user_ids()
+    success, failed = await send_broadcast(context.bot, user_ids, text, photo)
+
+    context.user_data.pop('broadcast_step', None)
+    context.user_data.pop('broadcast_text', None)
+    context.user_data.pop('broadcast_photo', None)
+
+    keyboard = [[InlineKeyboardButton("◀️ К рассылке", callback_data="admin_broadcast")]]
+    await query.message.edit_text(
+        f"✅ <b>Рассылка завершена!</b>\n\n"
+        f"📨 Доставлено: <b>{success}</b>\n"
+        f"❌ Не доставлено: <b>{failed}</b>\n"
+        f"👥 Всего: <b>{len(user_ids)}</b>",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='HTML',
+    )
+
+async def show_auto_broadcast_settings(query):
+    settings = get_broadcast_settings()
+    status = "✅ Включена" if settings['enabled'] else "❌ Выключена"
+    toggle_label = "🔴 Выключить" if settings['enabled'] else "🟢 Включить"
+    msg_preview = settings['message_text'][:100] if settings['message_text'] else "не задан"
+    if settings['message_text'] and len(settings['message_text']) > 100:
+        msg_preview += "..."
+
+    text = (
+        "⚙️ <b>Авто-рассылка</b>\n\n"
+        f"Статус: {status}\n"
+        f"⏱ Интервал: <b>{settings['interval_hours']} ч.</b>\n\n"
+        f"📝 Текст:\n<i>{msg_preview}</i>\n\n"
+        "Бот автоматически отправляет сообщение всем пользователям с заданным интервалом."
+    )
+    keyboard = [
+        [InlineKeyboardButton(toggle_label, callback_data="admin_broadcast_auto_toggle")],
+        [InlineKeyboardButton("⏱ Изменить интервал", callback_data="admin_broadcast_auto_interval")],
+        [InlineKeyboardButton("📝 Изменить текст", callback_data="admin_broadcast_auto_message")],
+        [InlineKeyboardButton("🧪 Тест (только вам)", callback_data="admin_broadcast_auto_test")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="admin_broadcast")],
+    ]
+    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+async def test_auto_broadcast(query, context: ContextTypes.DEFAULT_TYPE):
+    settings = get_broadcast_settings()
+    if not settings['message_text'] and not settings['photo_file_id']:
+        await query.answer("❌ Сначала задайте текст авто-рассылки", show_alert=True)
+        return
+    try:
+        if settings['photo_file_id']:
+            await context.bot.send_photo(
+                query.from_user.id,
+                photo=settings['photo_file_id'],
+                caption=settings['message_text'],
+                parse_mode='HTML',
+            )
+        else:
+            await context.bot.send_message(
+                query.from_user.id, settings['message_text'], parse_mode='HTML'
+            )
+        await query.answer("✅ Тестовое сообщение отправлено вам")
+    except Exception as e:
+        await query.answer(f"❌ Ошибка: {e}", show_alert=True)
+
+async def auto_broadcast_job(context: ContextTypes.DEFAULT_TYPE):
+    settings = get_broadcast_settings()
+    if not settings['enabled'] or (not settings['message_text'] and not settings['photo_file_id']):
+        return
+
+    if settings['last_sent']:
+        last_dt = datetime.fromisoformat(settings['last_sent'])
+        if datetime.now() - last_dt < timedelta(hours=settings['interval_hours']):
+            return
+
+    user_ids = get_all_user_ids()
+    if not user_ids:
+        return
+
+    logger.info(f"Авто-рассылка: {len(user_ids)} пользователей")
+    success, failed = await send_broadcast(
+        context.bot, user_ids, settings['message_text'], settings['photo_file_id']
+    )
+    save_broadcast_settings(last_sent=datetime.now().isoformat())
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                admin_id,
+                f"🤖 <b>Авто-рассылка выполнена</b>\n\n"
+                f"✅ Доставлено: {success}\n"
+                f"❌ Ошибок: {failed}",
+                parse_mode='HTML',
+            )
+        except Exception:
+            pass
 
 async def show_categories_for_config(query, context: ContextTypes.DEFAULT_TYPE):
     categories = get_vpn_categories()
@@ -930,6 +1220,26 @@ async def delete_category_confirm(query, category_id: int):
         parse_mode='HTML'
     )
 
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        return
+
+    photo = update.message.photo[-1].file_id
+    caption = update.message.caption or ""
+
+    if context.user_data.get('broadcast_step') == 'message':
+        context.user_data['broadcast_photo'] = photo
+        context.user_data['broadcast_text'] = caption
+        context.user_data['broadcast_step'] = 'confirm'
+        await show_broadcast_preview(update, context, is_message=True)
+        return
+
+    if context.user_data.get('auto_broadcast_step') == 'message':
+        save_broadcast_settings(message_text=caption, photo_file_id=photo)
+        context.user_data.pop('auto_broadcast_step', None)
+        await update.message.reply_text("✅ Авто-рассылка сохранена (фото + подпись)!")
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
@@ -972,6 +1282,34 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = update.effective_user.id
     
     if user_id not in ADMIN_IDS:
+        return
+
+    # Ручная рассылка
+    if context.user_data.get('broadcast_step') == 'message':
+        context.user_data['broadcast_text'] = update.message.text
+        context.user_data.pop('broadcast_photo', None)
+        context.user_data['broadcast_step'] = 'confirm'
+        await show_broadcast_preview(update, context, is_message=True)
+        return
+
+    # Настройка авто-рассылки
+    auto_step = context.user_data.get('auto_broadcast_step')
+    if auto_step == 'interval':
+        try:
+            hours = int(update.message.text.strip())
+            if hours < 1:
+                raise ValueError()
+            save_broadcast_settings(interval_hours=hours)
+            context.user_data.pop('auto_broadcast_step', None)
+            await update.message.reply_text(f"✅ Интервал авто-рассылки: <b>{hours} ч.</b>", parse_mode='HTML')
+        except ValueError:
+            await update.message.reply_text("❌ Введите целое число часов (минимум 1)")
+        return
+
+    if auto_step == 'message':
+        save_broadcast_settings(message_text=update.message.text, clear_photo=True)
+        context.user_data.pop('auto_broadcast_step', None)
+        await update.message.reply_text("✅ Текст авто-рассылки сохранён!")
         return
     
     # Добавление категории
@@ -1066,15 +1404,24 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     init_db()
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .job_queue(True)
+        .build()
+    )
     
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CallbackQueryHandler(button_callback))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+
+    if application.job_queue:
+        application.job_queue.run_repeating(auto_broadcast_job, interval=3600, first=60)
     
-    logger.info("🚀 Бот запущен с категориями VPN!")
+    logger.info("🚀 Бот запущен с категориями VPN и рассылкой!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
