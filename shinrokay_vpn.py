@@ -987,12 +987,13 @@ async def show_broadcast_preview(update_or_query, context: ContextTypes.DEFAULT_
     markup = InlineKeyboardMarkup(keyboard)
 
     if is_message:
+        msg = update_or_query.message
         if photo:
-            await update_or_query.reply_photo(
+            await msg.reply_photo(
                 photo=photo, caption=preview_text, reply_markup=markup, parse_mode='HTML'
             )
         else:
-            await update_or_query.reply_text(preview_text, reply_markup=markup, parse_mode='HTML')
+            await msg.reply_text(preview_text, reply_markup=markup, parse_mode='HTML')
     else:
         if photo:
             await update_or_query.message.reply_photo(
